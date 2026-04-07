@@ -7,6 +7,24 @@ from qfit import Structure
 from qfit import XMap
 from qfit.xtal.transformer import get_transformer
 
+# ---------------------------------------------------------------------------
+# BINDING SITE ANCHOR
+# ---------------------------------------------------------------------------
+# Cartesian coordinates (Å) used to select the best peak after fitting.
+# The clash-free peak whose best conformer centroid is closest to this point wins.
+#
+# Set to a numpy array to hardcode a known binding site for your target.
+# Set to None to fall back to target-agnostic default: top z-score peak is used.
+#
+# MAC1 (P 4₃, space group #78):
+#   Centroid averaged over 16 reference ligands from pandda models.
+#   x6198 and x6214 excluded — they bind in the other dimer.
+BINDING_SITE_ANCHOR = np.array([-43.52, -25.27, 1.75])
+#
+# To use auto-detection instead, comment the line above and uncomment:
+# BINDING_SITE_ANCHOR = None
+# ---------------------------------------------------------------------------
+
 def build_argparser():
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -86,6 +104,7 @@ class LigandPlacer():
         
         best_ligand_score = 10
         merged_structure = self.apo_structure.copy()
+        candidate_peaks = []  # v4: (dist_to_anchor, mse, grid_idx, placed_ligand)
         
         # Get ligand center (calculate once)
         ligand_center = self.ligand_structure.coor.mean(axis=0)
@@ -126,16 +145,39 @@ class LigandPlacer():
             # Write out all conformers for this peak
             self._write_conformers(placed_ligand_coor_set, peak_index=i)
 
-            # Check if this ligand is better than all previous ligands
             print(f'{i}, {ligand_score}, {best_coor_set}')
-            if ligand_score < best_ligand_score:
-                best_ligand_score = ligand_score
-                best_ligand = self.placed_ligand
-                chosen_peak = grid_idx
-            
-        # Merge with apo structure
-        if best_ligand_score == 10:
+
+            # v1 (PXR): take peak with lowest MSE across all peaks
+            # (broken for MAC1 — flat low-density regions outside pocket score artificially low)
+            # if ligand_score < best_ligand_score:
+            #     best_ligand_score = ligand_score
+            #     best_ligand = self.placed_ligand
+            #     chosen_peak = grid_idx
+
+            # v3: take first clash-free peak (highest z-score)
+            # (better than v1 but regresses on datasets where top z-score peak != binding site)
+            # if best_ligand_score == 10:  # not yet assigned
+            #     best_ligand_score = ligand_score
+            #     best_ligand = self.placed_ligand
+            #     chosen_peak = grid_idx
+            #     print(f'Selected peak {i} (z={z_score:.2f}) as best — first clash-free peak')
+            #     break  # stop after first valid peak
+
+            # v4: collect all clash-free peaks, then pick the one closest to binding site anchor
+            dist_to_anchor = np.linalg.norm(self.placed_ligand.coor.mean(axis=0) - BINDING_SITE_ANCHOR)
+            print(f'Peak {i} (z={z_score:.2f}): MSE={ligand_score:.3f}, dist_to_anchor={dist_to_anchor:.2f} Å')
+            candidate_peaks.append((dist_to_anchor, ligand_score, grid_idx, self.placed_ligand.copy()))
+
+        # v4: pick candidate closest to known binding site anchor
+        if len(candidate_peaks) == 0:
             raise ValueError('all ligands had MSE > 10')
+        candidate_peaks.sort(key=lambda c: c[0])  # sort by distance to anchor
+        best_dist, best_mse, chosen_peak, best_ligand = candidate_peaks[0]
+        print(f'\nSelected peak closest to anchor: dist={best_dist:.2f} Å, MSE={best_mse:.3f}')
+
+        # v1/v3 error check (kept for reference):
+        # if best_ligand_score == 10:
+        #     raise ValueError('all ligands had MSE > 10')
         print(f'Merging ligand at grid coor: {chosen_peak}')
         merged_structure = merged_structure.combine(best_ligand)
             
@@ -174,12 +216,12 @@ class LigandPlacer():
         # Convert peak to fractional coordinates
         peak_frac = self.zmap.unit_cell.orth_to_frac @ peak_coord
         
-        # P212121 symmetry operations in fractional coordinates
+        # P43 (space group No. 78) symmetry operations in fractional coordinates
         symops_frac = [
-            lambda xyz: xyz,  # x, y, z
-            lambda xyz: np.array([-xyz[0] + 0.5, -xyz[1], xyz[2] + 0.5]),  # -x+1/2, -y, z+1/2
-            lambda xyz: np.array([-xyz[0], xyz[1] + 0.5, -xyz[2] + 0.5]),  # -x, y+1/2, -z+1/2
-            lambda xyz: np.array([xyz[0] + 0.5, -xyz[1] + 0.5, -xyz[2]])   # x+1/2, -y+1/2, -z
+            lambda xyz: np.array([ xyz[0],  xyz[1],  xyz[2]       ]),  # x,  y,  z
+            lambda xyz: np.array([-xyz[0], -xyz[1],  xyz[2] + 0.75]),  # -x, -y, z+3/4
+            lambda xyz: np.array([-xyz[1],  xyz[0],  xyz[2] + 0.25]),  # -y,  x, z+1/4
+            lambda xyz: np.array([ xyz[1], -xyz[0],  xyz[2] + 0.5 ]),  #  y, -x, z+1/2
         ]
         
         # Generate all combinations of translations (-1, 0, 1) in x, y, z
@@ -531,23 +573,38 @@ class LigandPlacer():
         
         # Get binding site reference atoms (Met243 and Leu308 CA atoms, chains A and B)
         # Build selection string for iotbx
-        selection_strings = []
-        for chain_id in ['A', 'B']:
-            for resseq in [243, 308]:
-                selection_strings.append(f"(chain {chain_id} and resseq {resseq} and name CA)")
+
+                # Commenting out below section since I want to test if we need to restrict based on a binding site based on known ligand interactions
+
+        # selection_strings = []
+        # for chain_id in ['A', 'B']:
+        #     for resseq in [243, 308]:
+        #         selection_strings.append(f"(chain {chain_id} and resseq {resseq} and name CA)")
         
-        # Combine with OR
-        full_selection_string = " or ".join(selection_strings)
+        # # Combine with OR
+        # full_selection_string = " or ".join(selection_strings)
         
-        try:
-            binding_site_selection = self.apo_structure.select(full_selection_string)
-            binding_site_structure = self.apo_structure.extract(binding_site_selection)
-            binding_site_coords = binding_site_structure.coor
-        except Exception as e:
-            binding_site_coords = None
+        # try:
+        #     binding_site_selection = self.apo_structure.select(full_selection_string)
+        #     binding_site_structure = self.apo_structure.extract(binding_site_selection)
+        #     binding_site_coords = binding_site_structure.coor
+        # except Exception as e:
         
-        # Get protein center for symmetry mate selection
-        protein_center = self.apo_structure.coor.mean(axis=0)
+        binding_site_coords = None
+        
+        # v1/v3: used protein center of mass as anchor for symmetry mate selection
+        # (wrong when binding pocket is offset from protein centroid)
+        # protein_center = self.apo_structure.coor.mean(axis=0)
+
+        # v4: use BINDING_SITE_ANCHOR if set, otherwise fall back to top z-score peak
+        if BINDING_SITE_ANCHOR is not None:
+            binding_site_anchor = BINDING_SITE_ANCHOR
+            print(f"Binding site anchor (hardcoded): {binding_site_anchor}")
+        else:
+            top_i = sorted_idx[0]
+            z_top, y_top, x_top = peak_indices[top_i]
+            binding_site_anchor = self._grid_to_cartesian((x_top, y_top, z_top))
+            print(f"Binding site anchor (top z-score peak, auto): {binding_site_anchor}")
         
         # Track unique z-scores to remove symmetry duplicates
         used_zscores = set()
@@ -569,8 +626,8 @@ class LigandPlacer():
             grid_xyz = (x, y, z)
             peak_coord = self._grid_to_cartesian(grid_xyz)
             
-            # Find the symmetry mate closest to protein
-            best_peak_coord = self._find_symmetry_mate_near_protein(peak_coord, protein_center)
+            # Find the symmetry mate closest to the binding site anchor
+            best_peak_coord = self._find_symmetry_mate_near_protein(peak_coord, binding_site_anchor)
             
             # Check if peak is within 10 Å of binding site
             if binding_site_coords is not None:
